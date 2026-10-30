@@ -444,7 +444,39 @@ getgenv().SIMPLESPYCONFIG_MaxRemotes = 300
 local indent = 4
 local scheduled = {}
 local schedulerconnect
-local SimpleSpy = {}
+
+local function createSignal()
+	local listeners = {}
+	local signal = {}
+	function signal:Connect(callback)
+		local connection = {}
+		listeners[connection] = callback
+		function connection:Disconnect()
+			listeners[connection] = nil
+		end
+		return connection
+	end
+	function signal:Fire(...)
+		for _, cb in next, listeners do
+			task.spawn(cb, ...)
+		end
+	end
+	function signal:Wait()
+		local thread = coroutine.running()
+		local conn
+		conn = signal:Connect(function(...)
+			conn:Disconnect()
+			task.spawn(thread, ...)
+		end)
+		return coroutine.yield()
+	end
+	return signal
+end
+
+local OnRemoteFiredSignal = createSignal()
+local SimpleSpy = {
+	OnRemoteFired = OnRemoteFiredSignal,
+}
 local topstr = ""
 local bottomstr = ""
 local remotesFadeIn
@@ -513,6 +545,9 @@ xpcall(function()
 		end
 		if not isfolder("SimpleSpy//Assets") then
 			makefolder("SimpleSpy//Assets")
+		end
+		if not isfolder("SimpleSpy//Logs") then
+			makefolder("SimpleSpy//Logs")
 		end
 		if not isfile("SimpleSpy//Settings.json") then
 			writefile("SimpleSpy//Settings.json", jsone(realconfigs))
@@ -1377,23 +1412,36 @@ function newRemote(type, data)
 		Remote = remote,
 		DebugId = data.id,
 		metamethod = data.metamethod,
+		method = data.method or (type == "event" and "FireServer" or "InvokeServer"),
 		args = data.args,
 		Log = RemoteTemplate,
 		Button = Button,
 		Blocked = data.blocked,
 		Source = callingscript,
 		returnvalue = data.returnvalue,
+		time = tick(),
 		GenScript = "-- Generating, please wait...\n-- (If this message persists, the remote args are likely extremely long)",
 	}
 
 	logs[#logs + 1] = log
+
+	OnRemoteFiredSignal:Fire({
+		Name = log.Name,
+		Remote = log.Remote,
+		Method = log.method,
+		Args = log.args,
+		Source = log.Source,
+		Blocked = log.Blocked,
+		Time = log.time,
+		GetCode = function()
+			return SimpleSpy:GetCode(log)
+		end,
+	})
+
 	local connect = Button.MouseButton1Click:Connect(function()
 		logthread(running())
 		eventSelect(RemoteTemplate)
-		log.GenScript = genScript(log.Remote, log.args)
-		if log.Blocked then
-			log.GenScript = "-- THIS REMOTE WAS PREVENTED FROM FIRING TO THE SERVER BY SIMPLESPY\n\n" .. log.GenScript
-		end
+		log.GenScript = SimpleSpy:GetCode(log)
 		if selected == log and RemoteTemplate then
 			eventSelect(RemoteTemplate)
 		end
@@ -2450,6 +2498,121 @@ function SimpleSpy:newButton(name, description, onClick)
 	return newButton(name, description, onClick)
 end
 
+function SimpleSpy:GetLogs()
+	return logs
+end
+
+function SimpleSpy:GetLastLog()
+	return logs[#logs]
+end
+
+function SimpleSpy:GetCode(log)
+	if not log then
+		return ""
+	end
+	if not log.GenScript or (log.GenScript:sub(1, 2) == "--" and log.GenScript:find("Generating")) then
+		log.GenScript = genScript(log.Remote, log.args)
+		if log.Blocked then
+			log.GenScript = "-- THIS REMOTE WAS PREVENTED FROM FIRING TO THE SERVER BY SIMPLESPY\n\n" .. log.GenScript
+		end
+	end
+	return log.GenScript
+end
+
+function SimpleSpy:DumpLogs(options)
+	options = options or {}
+	local format = options.format or "lua"
+	local targetRemote = options.targetRemote
+	local filePath = options.filePath
+
+	local matchedLogs = {}
+	for _, l in ipairs(logs) do
+		if not targetRemote or l.Remote == targetRemote then
+			table.insert(matchedLogs, l)
+		end
+	end
+
+	if #matchedLogs == 0 then
+		return nil, "No logs to export"
+	end
+
+	if isfolder and makefolder then
+		pcall(function()
+			if not isfolder("SimpleSpy") then
+				makefolder("SimpleSpy")
+			end
+			if not isfolder("SimpleSpy//Logs") then
+				makefolder("SimpleSpy//Logs")
+			end
+		end)
+	end
+
+	if format == "json" then
+		local exportData = {}
+		for i, l in ipairs(matchedLogs) do
+			table.insert(exportData, {
+				Index = i,
+				Name = l.Name,
+				Remote = tostring(l.Remote),
+				Class = l.Remote and l.Remote.ClassName or "Unknown",
+				Method = l.method or "FireServer",
+				Time = l.time or 0,
+				Source = l.Source and tostring(l.Source) or nil,
+				Blocked = l.Blocked or false,
+			})
+		end
+		local jsonStr = ""
+		local encSuccess, encRes = pcall(function()
+			return jsone(exportData)
+		end)
+		jsonStr = encSuccess and encRes or "[]"
+		local defaultPath = ("SimpleSpy//Logs//Dump_%d_%d.json"):format(game.PlaceId, os.time())
+		local finalPath = filePath or defaultPath
+		if writefile then
+			pcall(writefile, finalPath, jsonStr)
+		end
+		return finalPath, jsonStr
+	else
+		local buffer = {}
+		table.insert(
+			buffer,
+			("-- SimpleSpy Session Dump\n-- PlaceId: %d | Captured Remotes: %d | Time: %s\n"):format(
+				game.PlaceId,
+				#matchedLogs,
+				os.date("!%Y-%m-%d %H:%M:%SZ")
+			)
+		)
+
+		local lastTime = matchedLogs[1].time or 0
+		for i, l in ipairs(matchedLogs) do
+			local code = SimpleSpy:GetCode(l)
+			local timeDiff = 0
+			if l.time and lastTime > 0 then
+				timeDiff = math.max(0, l.time - lastTime)
+				lastTime = l.time
+			end
+
+			table.insert(
+				buffer,
+				("\n-- [%d] %s (%s)"):format(i, l.Name, (l.Remote and l.Remote.ClassName or "Remote"))
+			)
+			if timeDiff > 0.05 then
+				table.insert(buffer, ("task.wait(%.3f)"):format(timeDiff))
+			end
+			table.insert(buffer, "do\n" .. code .. "\nend")
+		end
+
+		local finalScript = table.concat(buffer, "\n")
+		local remotePrefix = targetRemote and (targetRemote.Name .. "_") or "Dump_"
+		local defaultPath = ("SimpleSpy//Logs//%s%d_%d.lua"):format(remotePrefix, game.PlaceId, os.time())
+		local finalPath = filePath or defaultPath
+		if writefile then
+			pcall(writefile, finalPath, finalScript)
+		end
+		return finalPath, finalScript
+	end
+end
+
 ----- ADD ONS ----- (easily add or remove additonal functionality to the RemoteSpy!)
 --[[
     Some helpful things:
@@ -2524,6 +2687,66 @@ end, function()
 		end
 		setclipboard(v2s(selected.Source))
 		TextLabel.Text = "Done!"
+	end
+end)
+
+--- Saves all captured logs as a replayable Lua script to workspace/SimpleSpy/Logs/
+newButton("Save (Lua)", function()
+	return "Saves all captured remote logs as a replayable Lua script to workspace/SimpleSpy/Logs/"
+end, function()
+	if #logs == 0 then
+		TextLabel.Text = "No logs to save!"
+		return
+	end
+	TextLabel.Text = "Saving all logs..."
+	local path = SimpleSpy:DumpLogs({ format = "lua" })
+	if path then
+		if setclipboard then
+			pcall(setclipboard, path)
+		end
+		TextLabel.Text = ("Saved %d logs to %s (path copied)"):format(#logs, path)
+	else
+		TextLabel.Text = "Error saving logs!"
+	end
+end)
+
+--- Saves all calls to the selected remote as a Lua script
+newButton("Save Remote", function()
+	return "Saves all calls to the selected remote to workspace/SimpleSpy/Logs/"
+end, function()
+	if not selected or not selected.Remote then
+		TextLabel.Text = "No remote selected!"
+		return
+	end
+	TextLabel.Text = "Saving remote calls..."
+	local path = SimpleSpy:DumpLogs({ format = "lua", targetRemote = selected.Remote })
+	if path then
+		if setclipboard then
+			pcall(setclipboard, path)
+		end
+		TextLabel.Text = ("Saved '%s' calls to %s (path copied)"):format(selected.Remote.Name, path)
+	else
+		TextLabel.Text = "No calls found for this remote!"
+	end
+end)
+
+--- Saves all captured logs as structured JSON to workspace/SimpleSpy/Logs/
+newButton("Save (JSON)", function()
+	return "Exports all captured remote logs as structured JSON to workspace/SimpleSpy/Logs/"
+end, function()
+	if #logs == 0 then
+		TextLabel.Text = "No logs to export!"
+		return
+	end
+	TextLabel.Text = "Exporting JSON..."
+	local path = SimpleSpy:DumpLogs({ format = "json" })
+	if path then
+		if setclipboard then
+			pcall(setclipboard, path)
+		end
+		TextLabel.Text = ("Saved JSON to %s (path copied)"):format(path)
+	else
+		TextLabel.Text = "Error saving JSON!"
 	end
 end)
 
